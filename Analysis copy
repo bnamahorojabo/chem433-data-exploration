@@ -1,0 +1,103 @@
+import pandas as pd
+import anndata as ad
+from scipy.io import mmread
+import scipy.sparse
+import scanpy as sc
+import numpy as np
+import seaborn as sns
+import matplotlib.pyplot as plt
+from scipy.stats import ranksums
+from pathlib import Path
+import py3Dmol
+
+
+wd = str(Path.cwd().resolve())
+X = mmread(f"{wd}/data/GSE161824_A549_KRAS.processed.matrix.mtx").tocsr()
+genes = pd.read_csv(f"{wd}/data/GSE161824_A549_KRAS.processed.genes.csv", header=None)
+barcodes = pd.read_csv(f"{wd}/data/GSE161824_A549_KRAS.processed.cells.csv", header=None)
+
+adata = ad.AnnData(X)
+adata.var_names = genes[0].values
+adata.obs_names = barcodes[0].values
+
+
+sc.pp.calculate_qc_metrics(adata, inplace=True)
+adata = adata[adata.obs['n_genes_by_counts'] > 200, :]
+adata = adata[adata.obs['total_counts'] < 25000, :]
+sc.pp.filter_genes(adata, min_cells=10)
+sc.pp.filter_cells(adata, min_genes=1) # Prevent IndexError
+
+
+sc.pp.normalize_total(adata, target_sum=1e4)
+sc.pp.log1p(adata)
+
+
+variant2cell = pd.read_csv(f'{wd}/data/cell_variant_info.csv')
+
+def extract_variant(x):
+    if x == "KRAS_unassigned": return "WT"
+    num = ''.join(filter(str.isdigit, x))
+    return num
+
+variant2cell["variant"] = variant2cell["guide_identity"].apply(extract_variant)
+WT_set = set(variant2cell[variant2cell['variant']=='WT']['cell_barcode'])
+
+adata.obs['mut'] = 'Variant'
+adata.obs.loc[adata.obs_names.isin(WT_set), 'mut'] = 'WT'
+
+
+al_gene_list = ['APP','MAPT', 'APOE', 'PSEN1', 'PSEN2', 'TREM2', 'CLU', 'ABCA7', 'BACE1', 'NCSTN']
+al_genes = [g for g in al_gene_list if g in adata.var_names]
+
+if len(al_genes) >= 2:
+    # Pathway Scoring
+    sc.tl.score_genes(adata, al_genes, score_name='alzheimer_score')
+
+    # B. Statistical Significance
+    wt_scores = adata.obs[adata.obs['mut'] == 'WT']['alzheimer_score']
+    var_scores = adata.obs[adata.obs['mut'] == 'Variant']['alzheimer_score']
+    stat, p_val = ranksums(wt_scores, var_scores)
+    print(f"Alzheimer's Significance (WT vs Variant): p-value = {p_val:.4e}")
+
+    # Plots (Bar, Box, and Violin)
+    plt.figure(1)
+    sns.barplot(data=adata.obs, x='mut', y='alzheimer_score', palette='muted')
+    plt.title('Average Score')
+
+    plt.figure(2)
+    sns.boxplot(data=adata.obs, x='mut', y='alzheimer_score', palette='Set2')
+    plt.title('Box Plot')
+
+    plt.figure(3)
+    sns.violinplot(data=adata.obs, x='mut', y='alzheimer_score', inner='box', palette='Pastel1')
+    plt.title('Violin Plot')
+    
+    plt.show()
+
+    # D. Differential Gene Expression (DEGs)
+    sc.tl.rank_genes_groups(adata, groupby="mut", groups=["Variant"], reference="WT", method="wilcoxon")
+    deg = sc.get.rank_genes_groups_df(adata, group="Variant")
+    deg_alz = deg[deg['names'].isin(al_genes)]
+    print("\nTop Alzheimer's DEGs in Variant vs WT:")
+    print(deg_alz.head())
+
+    #PCA Visualization
+    adata_sub = adata[:, al_genes].copy()
+    if scipy.sparse.issparse(adata_sub.X):
+        adata_sub.X = adata_sub.X.toarray()
+    
+    # #Remove genes with 0 variance to prevent crashes
+    # variance_mask = np.array(adata_sub.X.std(axis=0) > 0)
+    # adata_sub = adata_sub[:, variance_mask].copy()
+
+    if adata_sub.n_vars >= 2:
+        sc.pp.scale(adata_sub)
+        sc.tl.pca(adata_sub, n_comps=min(adata_sub.n_vars - 1, 50))
+        sc.pl.pca(adata_sub, color="mut", title="PCA: Alzheimer's Pathway Profile")
+
+# --- 5. MOLECULAR VISUALIZATION (Amyloid-Beta) ---
+mol1 = py3Dmol.view(query='pdb:1IYT') 
+mol1.setStyle({'cartoon': {'color': 'orange', 'style':'tube'}})
+mol1.addStyle({'resn': ['VAL', 'LEU', 'ILE']}, {'stick': {'colorscheme': 'yellowCarbon'}})
+mol1.zoomTo()
+mol1.show()
